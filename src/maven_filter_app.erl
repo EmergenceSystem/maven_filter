@@ -29,21 +29,54 @@ base_capabilities() ->
                                       <<"scala">>, <<"packages">>].
 
 %%====================================================================
-%% Application behaviour
+%% Application lifecycle
 %%====================================================================
 
 start(_Type, _Args) ->
-    em_filter:start_agent(maven_filter, ?MODULE, #{
-        capabilities => base_capabilities()
-    }),
-    {ok, self()}.
+    case maven_filter_sup:start_link() of
+        {ok, Pid} ->
+            ok = start_pop_and_http(),
+            {ok, Pid};
+        Error ->
+            Error
+    end.
 
 stop(_State) ->
-    em_filter:stop_agent(maven_filter).
+    catch cowboy:stop_listener(maven_filter_query_listener),
+    catch em_pop_sup:stop_node(maven_filter),
+    ok.
 
 %%====================================================================
-%% Agent handler
+%% Internal
 %%====================================================================
+
+start_pop_and_http() ->
+    PopPort   = application:get_env(maven_filter, pop_port,   9464),
+    QueryPort = application:get_env(maven_filter, query_port, 9465),
+    Seeds     = application:get_env(maven_filter, pop_seeds,  []),
+    Vec = em_filter_vec:from_capabilities(base_capabilities()),
+    catch em_pop_sup:stop_node(maven_filter),
+    catch cowboy:stop_listener(maven_filter_query_listener),
+    {ok, PopPid} = em_pop_sup:start_node(maven_filter, #{
+        port            => PopPort,
+        query_port      => QueryPort,
+        vector          => Vec,
+        max_peers       => 100,
+        gossip_interval => 5_000
+    }),
+    lists:foreach(
+        fun({H, P}) -> catch em_pop_node:add_peer(PopPid, H, P) end,
+        Seeds),
+    Dispatch = cowboy_router:compile([
+        {'_', [{"/agent/query", em_filter_http,
+                #{server => maven_filter_server}}]}
+    ]),
+    {ok, _} = cowboy:start_clear(maven_filter_query_listener,
+                                  [{port, QueryPort}],
+                                  #{env => #{dispatch => Dispatch}}),
+    logger:notice("[maven_filter] gossip port ~w  query port ~w",
+                  [PopPort, QueryPort]),
+    ok.
 
 handle(Body, Memory) when is_binary(Body) ->
     {generate_embryo_list(Body), Memory};
